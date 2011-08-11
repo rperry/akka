@@ -226,6 +226,15 @@ object AkkaBuild extends Build {
   //   )
   // )
 
+  lazy val zeromq = Project(
+    id = "akka-zeromq",
+    base = file("akka-zeromq"),
+    dependencies = Seq(actor, testkit % "test"),
+    settings = defaultSettings ++ Seq(
+      libraryDependencies ++= Dependencies.zeromq
+    )
+  )
+
   lazy val samples = Project(
     id = "akka-samples",
     base = file("akka-samples"),
@@ -415,6 +424,8 @@ object Dependencies {
   val spring = Seq(springBeans, springContext, Test.junit, Test.scalatest)
 //  val spring = Seq(springBeans, springContext, camelSpring, Test.junit, Test.scalatest)
 
+  val zeromq = Seq(protobuf, Test.scalatest) // Add 'jzmq' to dependencies when available on Typesafe's repo
+
   val kernel = Seq(
     jettyUtil, jettyXml, jettyServlet, jerseyCore, jerseyJson, jerseyScala,
     jacksonCore, staxApi, Provided.jerseyServer
@@ -443,6 +454,7 @@ object Dependency {
     val Slf4j        = "1.6.0"
     val Spring       = "3.0.5.RELEASE"
     val Zookeeper    = "3.4.0"
+    val Jzmq         = "2.1.0-SNAPSHOT"
   }
 
   // Compile
@@ -481,6 +493,7 @@ object Dependency {
   val zkClient      = "zkclient"                    % "zkclient"               % "0.3"        // ApacheV2
   val zookeeper     = "org.apache.hadoop.zookeeper" % "zookeeper"              % V.Zookeeper  // ApacheV2
   val zookeeperLock = "org.apache.hadoop.zookeeper" % "zookeeper-recipes-lock" % V.Zookeeper  // ApacheV2
+  val jzmq          = "org.zeromq"                  % "jzmq"                   % V.Jzmq       // LGPLv3
 
   // Provided
 
