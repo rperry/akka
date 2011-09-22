@@ -13,8 +13,12 @@ import akka.actor.UntypedChannel._
 
 import java.util.concurrent.atomic.{ AtomicReference, AtomicInteger }
 import akka.dispatch.{ Future, Futures }
-import akka.util.ReflectiveAccess
 import collection.JavaConversions.iterableAsScalaIterable
+import java.util.Date
+import akka.util.{ duration, ReflectiveAccess }
+import duration._
+import com.eaio.uuid.UUID
+import akka.cluster.metrics._
 
 sealed trait RouterType
 
@@ -205,6 +209,8 @@ trait Router {
    * @throws RoutingExceptionif something goes wrong while routing the message.
    */
   def route[T](message: Any, timeout: Timeout)(implicit sender: Option[ActorRef]): Future[T]
+
+  def shutdown(): Unit = Unit
 }
 
 /**
@@ -326,6 +332,12 @@ object Routing {
         new RandomRouter()
       case RouterType.RoundRobin ⇒
         new RoundRobinRouter()
+      case RouterType.LeastCPU ⇒
+        new LeastCPURouter(actorAddress)
+      case RouterType.LeastMessages ⇒
+        new LeastMessageRouter(actorAddress)
+      case RouterType.LeastRAM ⇒
+        new LeastMessageRouter(actorAddress)
       case r ⇒
         throw new IllegalArgumentException("Unsupported routerType " + r)
     }
@@ -632,8 +644,6 @@ class RoundRobinRouter extends BasicRouter {
  * (wrapped into {@link Routing.Broadcast} and sent with "?" method). For the messages, sent in a fire-forget
  * mode, the router would behave as {@link BasicRouter}, unless it's mixed in with other router type
  *
- *  FIXME: This also is the location where a failover  is done in the future if an ActorRef fails and a different one needs to be selected.
- * FIXME: this is also the location where message buffering should be done in case of failure.
  */
 trait ScatterGatherRouter extends BasicRouter with Serializable {
 
@@ -676,5 +686,152 @@ trait ScatterGatherRouter extends BasicRouter with Serializable {
 class ScatterGatherFirstCompletedRouter extends RoundRobinRouter with ScatterGatherRouter {
 
   protected def gather[S, G >: S](results: Iterable[Future[S]]): Future[G] = Futures.firstCompletedOf(results)
+
+}
+
+/*
+  LoadAdaptiveRouter is a kind of generic router that picks an appropriate connection from many,
+   with regards to the load on node (CPU load, amount of free heap) or an actor's daemon (number
+   of messages in the mailbox). LoadAdaptiveRouter has a metrics monitor that refreshes internal state
+    of the router with an up-to-date metrics.
+ */
+trait LoadAdaptiveRouter[T <: Metrics] extends RoundRobinRouter with ClusterMetricsMonitor[T] {
+
+  def id = newUuid().toString
+
+  /*
+  Address of a clustered actor
+   */
+  val actorAddress: String
+
+  /*
+  Internal state with the metrics that the routing is based on, is updated after the specified
+  refresh interval
+   */
+  private val refreshInterval = Actor.cluster.metricsManager.refreshTimeout
+
+  /*
+  Internal state of the router with cached metrics, lastly used actor's daemon, and the timestamp made, when
+  the metrics has been taken
+   */
+  private val state = new AtomicReference[Option[AdaptiveRouterState]](None)
+
+  /*
+  Returns the next connection (actor daemon) that the message will be sent to
+   */
+  override def next: Option[ActorRef] = {
+    val currentState = getState()
+    if (currentState.isDefined) currentState.get.ref
+    else super.next
+  }
+
+  /*
+  Initializes router, and registers metrics monitor
+   */
+  override def init(connections: RouterConnections) = {
+    super.init(connections)
+    Actor.cluster.metricsManager.addMonitor(this)
+  }
+
+  /*
+  Shuts the router down, and unregisters associated metrics monitor
+   */
+  override def shutdown() = Actor.cluster.metricsManager.removeMonitor(this)
+
+  /*
+  Router accepts all the metrics
+   */
+  def reactsOn(allMetrics: Array[T]) = allMetrics != null
+
+  /*
+  When new metrics are passed to an associated monitor, router updates its state
+   */
+  @tailrec
+  final def react(allMetrics: Array[T]): Unit =
+    if (!state.compareAndSet(state.get(),
+      Some(AdaptiveRouterState(None, allMetrics, System.currentTimeMillis))))
+      react(allMetrics)
+
+  /*
+  Router picks one connection from many on the basis of <code>load</code> function
+  that takes metrics of one node/actor and return a numeric value (heap space, CPU load, number of messages
+  in the actor's mailbox). The message is router to the node/actor with the smallest load value.
+   */
+  protected def load(metrics: T): Double
+
+  @tailrec
+  private def getState(): Option[AdaptiveRouterState] = {
+    val currentStateOpt = state.get()
+    if (currentStateOpt.isEmpty) {
+      None
+    } else {
+      val currentState = currentStateOpt.get
+      if (currentState.ref.isDefined &&
+        ((currentState.timestamp + refreshInterval.toMillis) > System.currentTimeMillis)) {
+        Some(currentState)
+      } else {
+
+        val clusterMetrics = currentState.metrics
+          .filter(m ⇒ Actor.cluster.isInUseOnNode(actorAddress, m.nodeName))
+
+        val targetActor = if (!clusterMetrics.isEmpty) {
+
+          val targetNodeName = clusterMetrics.minBy(load).nodeName
+          Actor.cluster.remoteSocketAddressForNode(targetNodeName).flatMap { nodeAddress ⇒
+            (connections.versionedIterable.iterable.flatMap {
+              case actor: RemoteActorRef if (actor.remoteAddress.equals(nodeAddress)) ⇒
+                Some(actor)
+              case _ ⇒ None
+            }).headOption
+          }
+
+        } else None
+
+        val newState = new AdaptiveRouterState(targetActor, clusterMetrics, System.currentTimeMillis)
+
+        if (state.compareAndSet(currentStateOpt, Some(newState)))
+          Some(newState)
+        else getState()
+      }
+    }
+  }
+
+  /*
+  * Internal state of the router with cached metrics and ref to an actor
+  * @param ref reference to the connection that the last message has been routed to
+  * @param metrics metrics gathered at the cluster nodes
+  * @param timestamp time when the metrics has been gathered last
+   */
+  protected case class AdaptiveRouterState(ref: Option[ActorRef], metrics: Array[T], timestamp: Long)
+
+}
+
+/*
+ * LeastCPURouter sends messages to a connection that resides at the node with the smallest value
+ * of system load average
+ */
+class LeastCPURouter(val actorAddress: String) extends LoadAdaptiveRouter[NodeMetrics] {
+
+  protected def load(metrics: NodeMetrics) = metrics.systemLoadAverage
+
+}
+
+/*
+ * LeastCPURouter sends messages to a connection that resides at the node with smallest amount
+ * of heap memory used
+ */
+class LeastRAMRouter(val actorAddress: String) extends LoadAdaptiveRouter[NodeMetrics] {
+
+  protected def load(metrics: NodeMetrics) = metrics.usedHeapMemory
+
+}
+
+/*
+ * LeastMessageRouter sends messages to the connection with the smallest number of unprocessed
+ * messages in the mailbox
+ */
+class LeastMessageRouter(val actorAddress: String) extends LoadAdaptiveRouter[ActorMetrics] with ActorMetricsMonitor {
+
+  protected def load(metrics: ActorMetrics) = metrics.mailboxSize
 
 }

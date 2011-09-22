@@ -21,7 +21,7 @@ object RemoteMetricsMultiJvmSpec {
   val MetricsRefreshTimeout = 100.millis
 }
 
-class AllMetricsAvailableMonitor(_id: String, completionLatch: CountDownLatch, clusterSize: Int) extends ClusterMetricsAlterationMonitor {
+class AllMetricsAvailableMonitor(_id: String, completionLatch: CountDownLatch, clusterSize: Int) extends ClusterMetricsMonitor[NodeMetrics] {
 
   val id = _id
 

@@ -75,7 +75,7 @@ class LocalMetricsMultiJvmNode1 extends MasterClusterTestNode {
     "allow to track JVM state and bind handles through MetricsAlterationMonitors" in {
       val monitorReponse = new DefaultPromise[String]
 
-      node.metricsManager.addMonitor(new LocalMetricsAlterationMonitor {
+      node.metricsManager.addMonitor(new MetricsAlterationMonitor[NodeMetrics] {
 
         val id = "heapMemoryThresholdMonitor"
 
@@ -89,7 +89,7 @@ class LocalMetricsMultiJvmNode1 extends MasterClusterTestNode {
 
     }
 
-    class FooMonitor(monitorWorked: AtomicInteger) extends LocalMetricsAlterationMonitor {
+    class FooMonitor(monitorWorked: AtomicInteger) extends MetricsAlterationMonitor[NodeMetrics] {
       val id = "fooMonitor"
       def reactsOn(metrics: NodeMetrics) = true
       def react(metrics: NodeMetrics) = monitorWorked.set(monitorWorked.get + 1)
@@ -115,7 +115,7 @@ class LocalMetricsMultiJvmNode1 extends MasterClusterTestNode {
 
       val monitorWorked = new AtomicInteger(0)
 
-      node.metricsManager.addMonitor(new LocalMetricsAlterationMonitor {
+      node.metricsManager.addMonitor(new MetricsAlterationMonitor[NodeMetrics] {
         val id = "fooMonitor"
         def reactsOn(metrics: NodeMetrics) = true
         def react(metrics: NodeMetrics) = monitorWorked.set(monitorWorked.get + 1)

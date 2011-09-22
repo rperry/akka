@@ -143,12 +143,12 @@ trait NodeMetricsManager {
   /*
      * Adds monitor that reacts, when specific conditions are satisfied  
      */
-  def addMonitor(monitor: MetricsAlterationMonitor): Unit
+  def addMonitor[T](monitor: MetricsAlterationMonitor[T]): Unit
 
   /*
      * Removes monitor
      */
-  def removeMonitor(monitor: MetricsAlterationMonitor): Unit
+  def removeMonitor[T](monitor: MetricsAlterationMonitor[T]): Unit
 
   /*
      * Removes metrics of s specified node from ZooKeeper and metrics manager cache
@@ -569,7 +569,7 @@ trait ClusterNode {
     newlyConnectedMembershipNodes: Traversable[String],
     newlyDisconnectedMembershipNodes: Traversable[String]): Map[String, InetSocketAddress]
 
-  private[cluster] def remoteSocketAddressForNode(node: String): Option[InetSocketAddress]
+  private[akka] def remoteSocketAddressForNode(node: String): Option[InetSocketAddress]
 
   private[cluster] def membershipPathFor(node: String): String
   private[cluster] def configurationPathFor(key: String): String

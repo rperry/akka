@@ -50,10 +50,9 @@ import com.eaio.uuid.UUID
 
 import com.google.protobuf.ByteString
 
-import java.util.concurrent.{ CopyOnWriteArrayList, Callable, ConcurrentHashMap }
-
 import annotation.tailrec
 import javax.management.{ StandardMBean }
+import java.util.concurrent.{ TimeUnit, CopyOnWriteArrayList, Callable, ConcurrentHashMap }
 
 // FIXME add watch for each node that when the entry for the node is removed then the node shuts itself down
 
@@ -206,6 +205,8 @@ object Cluster {
     new DefaultClusterNode(nodeAddress, hostname, port, zooKeeperServers, defaultZooKeeperSerializer)
   }
 
+  node.metricsManager.start()
+
   /**
    * Creates a new AkkaZkClient.
    */
@@ -308,8 +309,6 @@ class DefaultClusterNode private[akka] (
 
   lazy val remoteServerAddress: InetSocketAddress = remoteService.address
 
-  lazy val metricsManager: NodeMetricsManager = new LocalNodeMetricsManager(zkClient, Cluster.metricsRefreshInterval).start()
-
   // static nodes
   val CLUSTER_PATH = "/" + nodeAddress.clusterName
   val MEMBERSHIP_PATH = CLUSTER_PATH + "/members"
@@ -320,7 +319,9 @@ class DefaultClusterNode private[akka] (
   val ACTOR_UUID_REGISTRY_PATH = CLUSTER_PATH + "/actor-uuid-registry"
   val ACTOR_ADDRESS_TO_UUIDS_PATH = CLUSTER_PATH + "/actor-address-to-uuids"
   val NODE_TO_ACTOR_UUIDS_PATH = CLUSTER_PATH + "/node-to-actors-uuids"
-  val NODE_METRICS = CLUSTER_PATH + "/metrics"
+  val NODE_METRICS = CLUSTER_PATH + "/metrics-node"
+  val ACTOR_METRICS = CLUSTER_PATH + "/metrics-actor"
+  val ACTOR_AT_NODE_METRICS = ACTOR_METRICS + "/node"
 
   val basePaths = List(
     CLUSTER_PATH,
@@ -332,7 +333,9 @@ class DefaultClusterNode private[akka] (
     ACTOR_ADDRESS_TO_UUIDS_PATH,
     CONFIGURATION_PATH,
     PROVISIONING_PATH,
-    NODE_METRICS)
+    NODE_METRICS,
+    ACTOR_METRICS,
+    ACTOR_AT_NODE_METRICS)
 
   val LEADER_ELECTION_PATH = CLUSTER_PATH + "/leader" // should NOT be part of 'basePaths' only used by 'leaderLock'
 
@@ -364,6 +367,9 @@ class DefaultClusterNode private[akka] (
 
   // ZooKeeper client
   private[cluster] val zkClient = new AkkaZkClient(zkServerAddresses, sessionTimeout, connectionTimeout, serializer)
+
+  // Metrics manager evaluation must be eager
+  val metricsManager = new LocalNodeMetricsManager(zkClient, Cluster.metricsRefreshInterval)
 
   // leader election listener, registered to the 'leaderLock' below
   private[cluster] val leaderElectionCallback = new LockListener {
@@ -1006,6 +1012,16 @@ class DefaultClusterNode private[akka] (
     case e: ZkNoNodeException ⇒ throw new IllegalStateException("No serializer found for actor with address [%s]".format(actorAddress))
   }
 
+  /*
+  * Returns UUID of an actor that resides at a specified node
+   */
+  def uuidForActorAddressOnNode(actorAddress: String, nodeName: String): Option[UUID] =
+    remoteSocketAddressForNode(nodeName) flatMap { nodeSocketAddress ⇒
+      inetSocketAddressesForActor(actorAddress)
+        .find(_._2.equals(nodeSocketAddress))
+        .map(_._1)
+    }
+
   /**
    * Returns addresses for nodes that the clustered actor is in use on.
    */
@@ -1365,7 +1381,7 @@ class DefaultClusterNode private[akka] (
     }
   }
 
-  private[cluster] def remoteSocketAddressForNode(node: String): Option[InetSocketAddress] = {
+  private[akka] def remoteSocketAddressForNode(node: String): Option[InetSocketAddress] = {
     try {
       Some(zkClient.readData(membershipPathFor(node), new Stat).asInstanceOf[InetSocketAddress])
     } catch {

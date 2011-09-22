@@ -30,9 +30,9 @@ object ClusterActorRef {
       case Direct        ⇒ () ⇒ new DirectRouter
       case Random        ⇒ () ⇒ new RandomRouter()
       case RoundRobin    ⇒ () ⇒ new RoundRobinRouter()
-      case LeastCPU      ⇒ sys.error("Router LeastCPU not supported yet")
-      case LeastRAM      ⇒ sys.error("Router LeastRAM not supported yet")
-      case LeastMessages ⇒ sys.error("Router LeastMessages not supported yet")
+      case LeastCPU      ⇒ () ⇒ new LeastCPURouter(actorAddress)
+      case LeastRAM      ⇒ () ⇒ new LeastRAMRouter(actorAddress)
+      case LeastMessages ⇒ () ⇒ new LeastMessageRouter(actorAddress)
     }
 
     val props = RoutedProps.apply().withDeployId(actorAddress).withTimeout(timeout).withRouter(routerFactory)

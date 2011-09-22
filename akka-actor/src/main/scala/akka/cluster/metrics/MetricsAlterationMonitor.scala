@@ -5,78 +5,40 @@
 package akka.cluster.metrics
 
 /*
- * {@link NodeMetricsManager} periodically refershes internal cache with node metrics from MBeans / Sigar. 
- * Every time local cache is refreshed, monitors plugged to the metrics manager are invoked. 
- * If updated metrics satisfy conditions, specified in <code>reactsOn</code>,  
- * <code>react</code> is called
- * 
- * @exampl {{{
- * class PeakCPULoadMonitor extends LocalMetricsAlterationMonitor {
- *      val id = "peak-cpu-load-monitor"
- *      
- *      def reactsOn(metrics: NodeMetrics) = 
- *          metrics.systemLoadAverage > 0.8
- *          
- *      def react(metrics: NodeMetrics) = 
- *          println("Peak average system load at node [%s] is reached!" format (metrics.nodeName))
- * }
- * }}}
- * 
+  When registered, MetricsAlterationMonitor is triggered, when the metrics (of a node, actor),
+  matching predicate are generated
  */
-trait LocalMetricsAlterationMonitor extends MetricsAlterationMonitor {
+trait MetricsAlterationMonitor[T] extends Comparable[MetricsAlterationMonitor[T]] {
 
-  /* 
-     * Definies conditions that must be satisfied in order to <code>react<code> on the changed metrics
+  /*
+     * Unique identifier of the monitor
      */
-  def reactsOn(metrics: NodeMetrics): Boolean
+  def id: String
+
+  def compareTo(otherMonitor: MetricsAlterationMonitor[T]) = id.compareTo(otherMonitor.id)
+
+  /*
+     * Defines conditions that must be satisfied in order to <code>react<code> on the changed metrics
+     */
+  def reactsOn(metrics: T): Boolean
 
   /*
      * Reacts on the changed metrics
      */
-  def react(metrics: NodeMetrics): Unit
+  def react(metrics: T): Unit
 
 }
 
 /*
- * {@link NodeMetricsManager} periodically refershes internal cache with metrics of all nodes in the cluster 
- * from ZooKeeper. Every time local cache is refreshed, monitors plugged to the metrics manager are invoked. 
- * If updated metrics satisfy conditions, specified in <code>reactsOn</code>,  
- * <code>react</code> is called
- * 
- * @exampl {{{
- * class PeakCPULoadReached extends ClusterMetricsAlterationMonitor {
- *      val id = "peak-cpu-load-reached"
- *      
- *      def reactsOn(metrics: Array[NodeMetrics]) = 
- *          metrics.forall(_.systemLoadAverage > 0.8)
- *      
- *      def react(metrics: Array[NodeMetrics]) = 
- *          println("One of the nodes in the scluster has reached the peak system load!")
- * }
- * }}}
- * 
+  ClusterMetricsMonitor is being triggered with the metrics gathered at all running cluster nodes
  */
-trait ClusterMetricsAlterationMonitor extends MetricsAlterationMonitor {
+trait ClusterMetricsMonitor[T <: Metrics] extends MetricsAlterationMonitor[Array[T]]
 
-  /* 
-     * Definies conditions that must be satisfied in order to <code>react<code> on the changed metrics
-     */
-  def reactsOn(allMetrics: Array[NodeMetrics]): Boolean
+/*
+  ActorMetricsMonitor watches clustered actors with daemons running at different cluster nodes
+ */
+trait ActorMetricsMonitor extends ClusterMetricsMonitor[ActorMetrics] {
 
-  /*
-     * Reacts on the changed metrics
-     */
-  def react(allMetrics: Array[NodeMetrics]): Unit
-
-}
-
-sealed trait MetricsAlterationMonitor extends Comparable[MetricsAlterationMonitor] {
-
-  /*
-     * Unique identiifier of the monitor
-     */
-  def id: String
-
-  def compareTo(otherMonitor: MetricsAlterationMonitor) = id.compareTo(otherMonitor.id)
+  def actorAddress: String
 
 }

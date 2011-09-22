@@ -5,14 +5,35 @@
 package akka.cluster.metrics
 
 /*
- * Snapshot of the JVM / system that's the node is running on
+  Generic metrics [node/actor] to be gathered
  */
-trait NodeMetrics {
+trait Metrics {
 
   /*
      * Name of the node the metrics are gathered at
      */
   def nodeName: String
+
+}
+
+/*
+  Basic metrics of a running actor
+ */
+trait ActorMetrics extends Metrics {
+
+  def actorAddress: String
+
+  /*
+  Current number of messages in the mailbox to be processed by the actor
+   */
+  def mailboxSize: Long
+
+}
+
+/*
+ * Snapshot of the JVM / system that's the node is running on
+ */
+trait NodeMetrics extends Metrics {
 
   /*
      *  Amount of heap memory currently used
