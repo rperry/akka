@@ -15,159 +15,201 @@ import scala.util.continuations._
 import akka.testkit._
 
 object IOActorSpec {
-  import IO._
 
   class SimpleEchoServer(host: String, port: Int, ioManager: ActorRef, started: TestLatch) extends Actor {
 
-    override def preStart = {
-      listen(ioManager, host, port)
-      started.open()
-    }
+    IO listen (ioManager, host, port)
 
-    def createWorker = Actor.actorOf(Props(new Actor with IO {
-      def receiveIO = {
-        case NewClient(server) ⇒
-          val socket = server.accept()
-          loopC {
-            val bytes = socket.read()
-            socket write bytes
-          }
-      }
-    }).withSupervisor(optionSelf))
+    started.open
+
+    val state = IO.IterateeRef.Map[IO.Handle]()
 
     def receive = {
-      case msg: NewClient ⇒
-        createWorker forward msg
+
+      case IO.NewClient(server) ⇒
+        val socket = server.accept()
+        state(socket) flatMap { _ ⇒
+          IO repeat {
+            IO.takeAny map { bytes ⇒
+              socket write bytes
+            }
+          }
+        }
+
+      case IO.Read(socket, bytes) ⇒
+        state(socket)(IO Chunk bytes)
+
+      case IO.Closed(socket, cause) ⇒
+        state -= socket
+
     }
 
   }
 
-  class SimpleEchoClient(host: String, port: Int, ioManager: ActorRef) extends Actor with IO {
+  class SimpleEchoClient(host: String, port: Int, ioManager: ActorRef) extends Actor {
 
-    lazy val socket: SocketHandle = connect(ioManager, host, port, reader)
-    lazy val reader: ActorRef = Actor.actorOf {
-      new Actor with IO {
-        def receiveIO = {
-          case length: Int ⇒
-            val bytes = socket.read(length)
-            reply(bytes)
-        }
-      }
-    }
+    val socket = IO connect (ioManager, host, port)
 
-    def receiveIO = {
+    val state = IO.IterateeRef()
+
+    def receive = {
+
       case bytes: ByteString ⇒
+        val source = channel
         socket write bytes
-        reader forward bytes.length
+        for {
+          _ ← state
+          bytes ← IO take bytes.length
+        } yield source tryTell bytes
+
+      case IO.Read(socket, bytes) ⇒
+        state(IO Chunk bytes)
+
+      case IO.Connected(socket) ⇒
+
+      case IO.Closed(socket, cause) ⇒
+        self.stop()
+
     }
+  }
+
+  sealed trait KVCommand {
+    def bytes: ByteString
+  }
+
+  case class KVSet(key: String, value: String) extends KVCommand {
+    val bytes = ByteString("SET " + key + " " + value.length + "\r\n" + value + "\r\n")
+  }
+
+  case class KVGet(key: String) extends KVCommand {
+    val bytes = ByteString("GET " + key + "\r\n")
+  }
+
+  case object KVGetAll extends KVCommand {
+    val bytes = ByteString("GETALL\r\n")
   }
 
   // Basic Redis-style protocol
   class KVStore(host: String, port: Int, ioManager: ActorRef, started: TestLatch) extends Actor {
 
-    var kvs: Map[String, ByteString] = Map.empty
+    val state = IO.IterateeRef.Map[IO.Handle]()
 
-    override def preStart = {
-      listen(ioManager, host, port)
-      started.open()
-    }
+    var kvs: Map[String, String] = Map.empty
 
-    def createWorker = Actor.actorOf(Props(new Actor with IO {
-      def receiveIO = {
-        case NewClient(server) ⇒
-          val socket = server.accept()
-          loopC {
-            val cmd = socket.read(ByteString("\r\n")).utf8String
-            val result = matchC(cmd.split(' ')) {
-              case Array("SET", key, length) ⇒
-                val value = socket read length.toInt
-                server.owner ? (('set, key, value)) map ((x: Any) ⇒ ByteString("+OK\r\n"))
-              case Array("GET", key) ⇒
-                server.owner ? (('get, key)) map {
-                  case Some(b: ByteString) ⇒ ByteString("$" + b.length + "\r\n") ++ b
-                  case None                ⇒ ByteString("$-1\r\n")
-                }
-              case Array("GETALL") ⇒
-                server.owner ? 'getall map {
-                  case m: Map[_, _] ⇒
-                    (ByteString("*" + (m.size * 2) + "\r\n") /: m) {
-                      case (result, (k: String, v: ByteString)) ⇒
-                        val kBytes = ByteString(k)
-                        result ++ ByteString("$" + kBytes.length + "\r\n") ++ kBytes ++ ByteString("$" + v.length + "\r\n") ++ v
-                    }
-                }
-            }
-            result recover {
-              case e ⇒ ByteString("-" + e.getClass.toString + "\r\n")
-            } foreach { bytes ⇒
-              socket write bytes
-            }
-          }
-      }
-    }).withSupervisor(self))
+    IO listen (ioManager, host, port)
+
+    started.open
+
+    val EOL = ByteString("\r\n")
 
     def receive = {
-      case msg: NewClient ⇒ createWorker forward msg
-      case ('set, key: String, value: ByteString) ⇒
-        kvs += (key -> value)
-        tryReply(())
-      case ('get, key: String) ⇒ tryReply(kvs.get(key))
-      case 'getall             ⇒ tryReply(kvs)
+
+      case IO.NewClient(server) ⇒
+        val socket = server.accept()
+        state(socket) flatMap { _ ⇒
+          IO repeat {
+            IO takeUntil EOL map (_.utf8String split ' ') flatMap {
+
+              case Array("SET", key, length) ⇒
+                for {
+                  value ← IO take length.toInt
+                  _ ← IO takeUntil EOL
+                } yield {
+                  kvs += (key -> value.utf8String)
+                  ByteString("+OK\r\n")
+                }
+
+              case Array("GET", key) ⇒
+                IO Iteratee {
+                  kvs get key map { value ⇒
+                    ByteString("$" + value.length + "\r\n" + value + "\r\n")
+                  } getOrElse ByteString("$-1\r\n")
+                }
+
+              case Array("GETALL") ⇒
+                IO Iteratee {
+                  (ByteString("*" + (kvs.size * 2) + "\r\n") /: kvs) {
+                    case (result, (k, v)) ⇒
+                      val kBytes = ByteString(k)
+                      val vBytes = ByteString(v)
+                      result ++
+                        ByteString("$" + kBytes.length) ++ EOL ++
+                        kBytes ++ EOL ++
+                        ByteString("$" + vBytes.length) ++ EOL ++
+                        vBytes ++ EOL
+                  }
+                }
+
+            } map (socket write)
+          }
+        }
+
+      case IO.Read(socket, bytes) ⇒
+        state(socket)(IO Chunk bytes)
+
+      case IO.Closed(socket, cause) ⇒
+        state -= socket
+
     }
 
   }
 
-  class KVClient(host: String, port: Int, ioManager: ActorRef) extends Actor with IO {
+  class KVClient(host: String, port: Int, ioManager: ActorRef) extends Actor {
 
-    var socket: SocketHandle = _
+    val socket = IO connect (ioManager, host, port)
 
-    override def preStart {
-      socket = connect(ioManager, host, port)
+    val state = IO.IterateeRef()
+
+    val EOL = ByteString("\r\n")
+
+    def receive = {
+      case cmd: KVCommand ⇒
+        val source = channel
+        socket write cmd.bytes
+        for {
+          _ ← state
+          result ← readResult
+        } yield result.fold(err ⇒ source sendException (new RuntimeException(err)), source tryTell)
+
+      case IO.Read(socket, bytes) ⇒
+        state(IO Chunk bytes)
+
+      case IO.Connected(socket) ⇒
+
+      case IO.Closed(socket, cause) ⇒
+        self.stop()
+
     }
 
-    def receiveIO = {
-      case ('set, key: String, value: ByteString) ⇒
-        socket write (ByteString("SET " + key + " " + value.length + "\r\n") ++ value)
-        tryReply(readResult)
-
-      case ('get, key: String) ⇒
-        socket write ByteString("GET " + key + "\r\n")
-        tryReply(readResult)
-
-      case 'getall ⇒
-        socket write ByteString("GETALL\r\n")
-        tryReply(readResult)
-    }
-
-    def readResult = {
-      val resultType = socket.read(1).utf8String
-      resultType match {
-        case "+" ⇒ socket.read(ByteString("\r\n")).utf8String
-        case "-" ⇒ sys error socket.read(ByteString("\r\n")).utf8String
+    def readResult: IO.Iteratee[Either[String, Any]] = {
+      IO take 1 map (_.utf8String) flatMap {
+        case "+" ⇒ IO takeUntil EOL map (msg ⇒ Right(msg.utf8String))
+        case "-" ⇒ IO takeUntil EOL map (err ⇒ Left(err.utf8String))
         case "$" ⇒
-          val length = socket.read(ByteString("\r\n")).utf8String
-          socket.read(length.toInt)
-        case "*" ⇒
-          val count = socket.read(ByteString("\r\n")).utf8String
-          var result: Map[String, ByteString] = Map.empty
-          repeatC(count.toInt / 2) {
-            val k = readBytes
-            val v = readBytes
-            result += (k.utf8String -> v)
+          IO takeUntil EOL map (_.utf8String.toInt) flatMap {
+            case -1 ⇒ IO Iteratee Right(None)
+            case length ⇒
+              for {
+                value ← IO take length
+                _ ← IO takeUntil EOL
+              } yield Right(Some(value.utf8String))
           }
-          result
-        case _ ⇒ sys error "Unexpected response"
+        case "*" ⇒
+          IO takeUntil EOL map (_.utf8String.toInt) flatMap {
+            case -1 ⇒ IO Iteratee Right(None)
+            case length ⇒
+              IO.takeList(length)(readResult) map { list ⇒
+                ((Right(Map()): Either[String, Map[String, String]]) /: list.grouped(2)) {
+                  case (Right(m), List(Right(Some(k: String)), Right(Some(v: String)))) ⇒ Right(m + (k -> v))
+                  case (Right(_), _) ⇒ Left("Unexpected Response")
+                  case (left, _) ⇒ left
+                }
+              }
+          }
+        case _ ⇒ IO Iteratee Left("Unexpected Response")
       }
     }
-
-    def readBytes = {
-      val resultType = socket.read(1).utf8String
-      if (resultType != "$") sys error "Unexpected response"
-      val length = socket.read(ByteString("\r\n")).utf8String
-      socket.read(length.toInt)
-    }
   }
-
 }
 
 class IOActorSpec extends WordSpec with MustMatchers with BeforeAndAfterEach {
@@ -226,20 +268,20 @@ class IOActorSpec extends WordSpec with MustMatchers with BeforeAndAfterEach {
       started.await
       val client1 = Actor.actorOf(new KVClient("localhost", 8067, ioManager))
       val client2 = Actor.actorOf(new KVClient("localhost", 8067, ioManager))
-      val f1 = client1 ? (('set, "hello", ByteString("World")))
-      val f2 = client1 ? (('set, "test", ByteString("No one will read me")))
-      val f3 = client1 ? (('get, "hello"))
+      val f1 = client1 ? KVSet("hello", "World")
+      val f2 = client1 ? KVSet("test", "No one will read me")
+      val f3 = client1 ? KVGet("hello")
       f2.await
-      val f4 = client2 ? (('set, "test", ByteString("I'm a test!")))
+      val f4 = client2 ? KVSet("test", "I'm a test!")
       f4.await
-      val f5 = client1 ? (('get, "test"))
-      val f6 = client2 ? 'getall
+      val f5 = client1 ? KVGet("test")
+      val f6 = client2 ? KVGetAll
       f1.get must equal("OK")
       f2.get must equal("OK")
-      f3.get must equal(ByteString("World"))
+      f3.get must equal(Some("World"))
       f4.get must equal("OK")
-      f5.get must equal(ByteString("I'm a test!"))
-      f6.get must equal(Map("hello" -> ByteString("World"), "test" -> ByteString("I'm a test!")))
+      f5.get must equal(Some("I'm a test!"))
+      f6.get must equal(Map("hello" -> "World", "test" -> "I'm a test!"))
       client1.stop
       client2.stop
       server.stop

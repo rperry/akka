@@ -4,7 +4,6 @@
 package akka.actor
 
 import akka.util.ByteString
-import akka.dispatch.Envelope
 import akka.event.EventHandler
 
 import java.net.InetSocketAddress
@@ -25,8 +24,7 @@ import java.nio.channels.{
 import scala.collection.mutable
 import scala.collection.immutable.Queue
 import scala.annotation.tailrec
-import scala.util.continuations._
-
+import scala.collection.generic.CanBuildFrom
 import com.eaio.uuid.UUID
 
 object IO {
@@ -48,18 +46,6 @@ object IO {
 
   sealed trait ReadHandle extends Handle with Product {
     override def asReadable = this
-
-    def read(len: Int)(implicit actor: Actor with IO): ByteString @cps[IOSuspendable[Any]] = shift { cont: (ByteString ⇒ IOSuspendable[Any]) ⇒
-      ByteStringLength(cont, this, actor.context.currentMessage, len)
-    }
-
-    def read()(implicit actor: Actor with IO): ByteString @cps[IOSuspendable[Any]] = shift { cont: (ByteString ⇒ IOSuspendable[Any]) ⇒
-      ByteStringAny(cont, this, actor.context.currentMessage)
-    }
-
-    def read(delimiter: ByteString, inclusive: Boolean = false)(implicit actor: Actor with IO): ByteString @cps[IOSuspendable[Any]] = shift { cont: (ByteString ⇒ IOSuspendable[Any]) ⇒
-      ByteStringDelimited(cont, this, actor.context.currentMessage, delimiter, inclusive, 0)
-    }
   }
 
   sealed trait WriteHandle extends Handle with Product {
@@ -125,129 +111,248 @@ object IO {
   def connect(ioManager: ActorRef, host: String, port: Int)(implicit sender: ScalaActorRef): SocketHandle =
     connect(ioManager, new InetSocketAddress(host, port), sender)
 
-  private class HandleState(var readBytes: ByteString, var connected: Boolean) {
-    def this() = this(ByteString.empty, false)
+  sealed trait Input {
+    def ++(that: Input): Input
   }
 
-  sealed trait IOSuspendable[+A]
-  sealed trait CurrentMessage { def message: Envelope }
-  private case class ByteStringLength(continuation: (ByteString) ⇒ IOSuspendable[Any], handle: Handle, message: Envelope, length: Int) extends IOSuspendable[ByteString] with CurrentMessage
-  private case class ByteStringDelimited(continuation: (ByteString) ⇒ IOSuspendable[Any], handle: Handle, message: Envelope, delimter: ByteString, inclusive: Boolean, scanned: Int) extends IOSuspendable[ByteString] with CurrentMessage
-  private case class ByteStringAny(continuation: (ByteString) ⇒ IOSuspendable[Any], handle: Handle, message: Envelope) extends IOSuspendable[ByteString] with CurrentMessage
-  private case class Retry(message: Envelope) extends IOSuspendable[Nothing]
-  private case object Idle extends IOSuspendable[Nothing]
-
-}
-
-trait IO {
-  this: Actor ⇒
-  import IO._
-
-  type ReceiveIO = PartialFunction[Any, Any @cps[IOSuspendable[Any]]]
-
-  implicit protected def ioActor: Actor with IO = this
-
-  private val _messages: mutable.Queue[Envelope] = mutable.Queue.empty
-
-  private var _state: Map[Handle, HandleState] = Map.empty
-
-  private var _next: IOSuspendable[Any] = Idle
-
-  private def state(handle: Handle): HandleState = _state.get(handle) match {
-    case Some(s) ⇒ s
-    case _ ⇒
-      val s = new HandleState()
-      _state += (handle -> s)
-      s
+  object Chunk {
+    val empty = Chunk(ByteString.empty)
   }
 
-  final def receive: Receive = {
-    case Read(handle, newBytes) ⇒
-      val st = state(handle)
-      st.readBytes ++= newBytes
-      run()
-    case Connected(socket) ⇒
-      state(socket).connected = true
-      run()
-    case msg @ Closed(handle, _) ⇒
-      _state -= handle // TODO: clean up better
-      if (_receiveIO.isDefinedAt(msg)) {
-        _next = reset { _receiveIO(msg); Idle }
-      }
-      run()
-    case msg if _next ne Idle ⇒
-      _messages enqueue context.currentMessage
-    case msg if _receiveIO.isDefinedAt(msg) ⇒
-      _next = reset { _receiveIO(msg); Idle }
-      run()
-  }
-
-  def receiveIO: ReceiveIO
-
-  def retry(): Any @cps[IOSuspendable[Any]] =
-    shift { _: (Any ⇒ IOSuspendable[Any]) ⇒
-      _next match {
-        case n: CurrentMessage ⇒ Retry(n.message)
-        case _                 ⇒ Idle
-      }
-    }
-
-  private lazy val _receiveIO = receiveIO
-
-  // only reinvoke messages from the original message to avoid stack overflow
-  private var reinvoked = false
-  private def reinvoke() {
-    if (!reinvoked && (_next eq Idle) && _messages.nonEmpty) {
-      try {
-        reinvoked = true
-        while ((_next eq Idle) && _messages.nonEmpty) self.asInstanceOf[LocalActorRef].underlying invoke _messages.dequeue
-      } finally {
-        reinvoked = false
-      }
+  case class Chunk(bytes: ByteString) extends Input {
+    def ++(that: Input) = that match {
+      case Chunk(more) ⇒ Chunk(bytes ++ more)
+      case _: EOF      ⇒ that
     }
   }
 
-  @tailrec
-  private def run() {
-    _next match {
-      case ByteStringLength(continuation, handle, message, waitingFor) ⇒
-        context.currentMessage = message
-        val st = state(handle)
-        if (st.readBytes.length >= waitingFor) {
-          val bytes = st.readBytes.take(waitingFor) //.compact
-          st.readBytes = st.readBytes.drop(waitingFor)
-          _next = continuation(bytes)
-          run()
-        }
-      case bsd @ ByteStringDelimited(continuation, handle, message, delimiter, inclusive, scanned) ⇒
-        context.currentMessage = message
-        val st = state(handle)
-        val idx = st.readBytes.indexOfSlice(delimiter, scanned)
-        if (idx >= 0) {
-          val index = if (inclusive) idx + delimiter.length else idx
-          val bytes = st.readBytes.take(index) //.compact
-          st.readBytes = st.readBytes.drop(idx + delimiter.length)
-          _next = continuation(bytes)
-          run()
+  case class EOF(cause: Option[Exception]) extends Input {
+    def ++(that: Input) = this
+  }
+
+  object Iteratee {
+    def apply[A](value: A): Iteratee[A] = Done(value)
+    def apply(): Iteratee[Unit] = unit
+    val unit: Iteratee[Unit] = Done(())
+  }
+
+  /**
+   * A basic Iteratee implementation of Oleg's Iteratee (http://okmij.org/ftp/Streams.html).
+   * No support for Enumerator or Input types other then ByteString at the moment.
+   */
+  sealed abstract class Iteratee[+A] {
+
+    final def apply(input: Input): Iteratee[A] = this match {
+      case Cont(f) ⇒ f(input) match {
+        case (iter, rest @ Chunk(bytes)) if bytes.nonEmpty ⇒ Cont(more ⇒ (iter, rest ++ more))
+        case (iter, _)                                     ⇒ iter
+      }
+      case iter ⇒ input match {
+        /**
+         * FIXME: will not automatically feed input into next continuation until 'apply'
+         * is called again with more Input. Possibly need to implment Enumerator to make
+         * this automatic, as it would then be able to store unused Input. Another solution
+         * is to add a 'rest: Input' variable to Done, although this can have weird edge
+         * cases (my original implementation did that, I did not like it).
+         *
+         * As a workaround, an empty Chunk can be input to the Iteratee once it is able to
+         * process the waiting Input (see 'flatMap' for an automatic workaround).
+         */
+        case _: Chunk ⇒ Cont(more ⇒ (iter, input ++ more))
+        case _        ⇒ iter
+      }
+    }
+
+    final def get: A = this(EOF(None)) match {
+      case Done(value) ⇒ value
+      case Cont(_)     ⇒ sys.error("Divergent Iteratee")
+      case Failure(e)  ⇒ throw e
+    }
+
+    final def flatMap[B](f: A ⇒ Iteratee[B]): Iteratee[B] = this match {
+      case Done(value)       ⇒ f(value)
+      case Cont(k: Chain[_]) ⇒ Cont(k :+ f)
+      case Cont(k)           ⇒ Cont(Chain(k, f)) //(Chunk.empty) <- uncomment for workaround to above FIXME
+      case failure: Failure  ⇒ failure
+    }
+
+    final def map[B](f: A ⇒ B): Iteratee[B] = this match {
+      case Done(value)       ⇒ Done(f(value))
+      case Cont(k: Chain[_]) ⇒ Cont(k :+ ((a: A) ⇒ Done(f(a))))
+      case Cont(k)           ⇒ Cont(Chain(k, (a: A) ⇒ Done(f(a))))
+      case failure: Failure  ⇒ failure
+    }
+
+  }
+
+  /**
+   * An Iteratee representing a result and the remaining ByteString. Also used to
+   * wrap any constants or precalculated values that need to be composed with
+   * other Iteratees.
+   */
+  final case class Done[+A](result: A) extends Iteratee[A]
+
+  /**
+   * An Iteratee that still requires more input to calculate it's result.
+   */
+  final case class Cont[+A](f: Input ⇒ (Iteratee[A], Input)) extends Iteratee[A]
+
+  /**
+   * An Iteratee representing a failure to calcualte a result.
+   * FIXME: move into 'Cont' as in Oleg's implementation
+   */
+  final case class Failure(exception: Throwable) extends Iteratee[Nothing]
+
+  object IterateeRef {
+    def apply[A](initial: Iteratee[A]): IterateeRef[A] = new IterateeRef(initial)
+    def apply(): IterateeRef[Unit] = new IterateeRef(Iteratee.unit)
+
+    class Map[K, V] private (refFactory: ⇒ IterateeRef[V], underlying: mutable.Map[K, IterateeRef[V]] = mutable.Map.empty[K, IterateeRef[V]]) extends mutable.Map[K, IterateeRef[V]] {
+      def get(key: K) = Some(underlying.getOrElseUpdate(key, refFactory))
+      def iterator = underlying.iterator
+      def +=(kv: (K, IterateeRef[V])) = { underlying += kv; this }
+      def -=(key: K) = { underlying -= key; this }
+      override def empty = new Map[K, V](refFactory)
+    }
+    object Map {
+      def apply[K, V](refFactory: ⇒ IterateeRef[V]): IterateeRef.Map[K, V] = new Map(refFactory)
+      def apply[K](): IterateeRef.Map[K, Unit] = new Map(IterateeRef())
+    }
+  }
+
+  /**
+   * A mutable reference to an Iteratee. Not thread safe.
+   *
+   * Designed for use within an Actor.
+   *
+   * Includes mutable implementations of flatMap, map, and apply which
+   * update the internal reference and return Unit.
+   */
+  final class IterateeRef[A](initial: Iteratee[A]) {
+    private var _value = initial
+    def flatMap(f: A ⇒ Iteratee[A]): Unit = _value = _value flatMap f
+    def map(f: A ⇒ A): Unit = _value = _value map f
+    def apply(input: Input): Unit = _value = _value(input)
+    def value: Iteratee[A] = _value
+  }
+
+  /**
+   * An Iteratee that returns the ByteString prefix up until the supplied delimiter.
+   * The delimiter is dropped by default, but it can be returned with the result by
+   * setting 'inclusive' to be 'true'.
+   */
+  def takeUntil(delimiter: ByteString, inclusive: Boolean = false): Iteratee[ByteString] = {
+    def step(taken: ByteString)(input: Input): (Iteratee[ByteString], Input) = input match {
+      case Chunk(more) ⇒
+        val bytes = taken ++ more
+        val startIdx = bytes.indexOfSlice(delimiter, math.max(taken.length - delimiter.length, 0))
+        if (startIdx >= 0) {
+          val endIdx = startIdx + delimiter.length
+          (Done(bytes take (if (inclusive) endIdx else startIdx)), Chunk(bytes drop endIdx))
         } else {
-          _next = bsd.copy(scanned = math.min(idx - delimiter.length, 0))
+          (Cont(step(bytes)), Chunk.empty)
         }
-      case ByteStringAny(continuation, handle, message) ⇒
-        context.currentMessage = message
-        val st = state(handle)
-        if (st.readBytes.length > 0) {
-          val bytes = st.readBytes //.compact
-          st.readBytes = ByteString.empty
-          _next = continuation(bytes)
-          run()
+      case eof ⇒ (Cont(step(taken)), eof)
+    }
+
+    Cont(step(ByteString.empty))
+  }
+
+  /**
+   * An Iteratee that returns a ByteString of the requested length.
+   */
+  def take(length: Int): Iteratee[ByteString] = {
+    def step(taken: ByteString)(input: Input): (Iteratee[ByteString], Input) = input match {
+      case Chunk(more) ⇒
+        val bytes = taken ++ more
+        if (bytes.length >= length)
+          (Done(bytes.take(length)), Chunk(bytes.drop(length)))
+        else
+          (Cont(step(bytes)), Chunk.empty)
+      case eof ⇒ (Cont(step(taken)), eof)
+    }
+
+    Cont(step(ByteString.empty))
+  }
+
+  /**
+   * An Iteratee that returns the remaining ByteString until an EOF is given.
+   */
+  val takeAll: Iteratee[ByteString] = {
+    def step(taken: ByteString)(input: Input): (Iteratee[ByteString], Input) = input match {
+      case Chunk(more) ⇒
+        val bytes = taken ++ more
+        (Cont(step(bytes)), Chunk.empty)
+      case eof ⇒ (Done(taken), eof)
+    }
+
+    Cont(step(ByteString.empty))
+  }
+
+  /**
+   * An Iteratee that returns any input it receives
+   */
+  val takeAny: Iteratee[ByteString] = Cont {
+    case Chunk(bytes) if bytes.nonEmpty ⇒ (Done(bytes), Chunk.empty)
+    case Chunk(bytes)                   ⇒ (takeAny, Chunk.empty)
+    case eof                            ⇒ (Done(ByteString.empty), eof)
+  }
+
+  def takeList[A](length: Int)(iter: Iteratee[A]): Iteratee[List[A]] = {
+    def step(left: Int, list: List[A]): Iteratee[List[A]] =
+      if (left == 0) Done(list.reverse)
+      else iter flatMap (a ⇒ step(left - 1, a :: list))
+
+    step(length, Nil)
+  }
+
+  def repeat(iter: Iteratee[Unit]): Iteratee[Unit] =
+    iter flatMap (_ ⇒ repeat(iter))
+
+  def traverse[A, B, M[A] <: Traversable[A]](in: M[A])(f: A ⇒ Iteratee[B])(implicit cbf: CanBuildFrom[M[A], B, M[B]]): Iteratee[M[B]] =
+    fold(cbf(in), in)((b, a) ⇒ f(a) map (b += _)) map (_.result)
+
+  def fold[A, B, M[A] <: Traversable[A]](initial: B, in: M[A])(f: (B, A) ⇒ Iteratee[B]): Iteratee[B] =
+    (Iteratee(initial) /: in)((ib, a) ⇒ ib flatMap (b ⇒ f(b, a)))
+
+  // private api
+
+  private[akka] object Chain {
+    def apply[A](f: Input ⇒ (Iteratee[A], Input)) = new Chain[A](f, Queue.empty)
+    def apply[A, B](f: Input ⇒ (Iteratee[A], Input), k: A ⇒ Iteratee[B]) = new Chain[B](f, Queue(k.asInstanceOf[Any ⇒ Iteratee[Any]]))
+  }
+
+  /**
+   * A function 'ByteString => Iteratee[A]' that composes with 'A => Iteratee[B]' functions
+   * in a stack-friendly manner.
+   *
+   * For internal use within Iteratee.
+   */
+  private[akka] final case class Chain[A] private (cur: Input ⇒ (Iteratee[Any], Input), queue: Queue[Any ⇒ Iteratee[Any]]) extends (Input ⇒ (Iteratee[A], Input)) {
+
+    def :+[B](f: A ⇒ Iteratee[B]) = new Chain[B](cur, queue enqueue f.asInstanceOf[Any ⇒ Iteratee[Any]])
+
+    def apply(input: Input): (Iteratee[A], Input) = {
+      @tailrec
+      def run(result: (Iteratee[Any], Input), queue: Queue[Any ⇒ Iteratee[Any]]): (Iteratee[Any], Input) = {
+        if (queue.isEmpty) result
+        else result match {
+          case (Done(value), rest) ⇒
+            val (head, tail) = queue.dequeue
+            head(value) match {
+              //case Cont(Chain(f, q)) ⇒ run(f(rest), q ++ tail) <- can cause big slowdown, need to test if needed
+              case Cont(f) ⇒ run(f(rest), tail)
+              case iter    ⇒ run((iter, rest), tail)
+            }
+          case (Cont(f), rest) ⇒
+            (Cont(new Chain(f, queue)), rest)
+          case _ ⇒ result
         }
-      case Retry(message) ⇒
-        message +=: _messages
-        _next = Idle
-        run()
-      case Idle ⇒ reinvoke()
+      }
+      run(cur(input), queue).asInstanceOf[(Iteratee[A], Input)]
     }
   }
+
 }
 
 class IOManager(bufferSize: Int = 8192) extends Actor {
