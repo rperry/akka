@@ -424,7 +424,7 @@ object Dependencies {
   val spring = Seq(springBeans, springContext, Test.junit, Test.scalatest)
 //  val spring = Seq(springBeans, springContext, camelSpring, Test.junit, Test.scalatest)
 
-  val zeromq = Seq(protobuf, Test.scalatest, jzmq)
+  val zeromq = Seq(protobuf, Test.scalatest, zmq)
 
   val kernel = Seq(
     jettyUtil, jettyXml, jettyServlet, jerseyCore, jerseyJson, jerseyScala,
@@ -454,7 +454,7 @@ object Dependency {
     val Slf4j        = "1.6.0"
     val Spring       = "3.0.5.RELEASE"
     val Zookeeper    = "3.4.0"
-    val Jzmq         = "2.1.0-SNAPSHOT"
+    val ZMQ          = "0.0.1-SNAPSHOT"
   }
 
   // Compile
@@ -493,7 +493,7 @@ object Dependency {
   val zkClient      = "zkclient"                    % "zkclient"               % "0.3"        // ApacheV2
   val zookeeper     = "org.apache.hadoop.zookeeper" % "zookeeper"              % V.Zookeeper  // ApacheV2
   val zookeeperLock = "org.apache.hadoop.zookeeper" % "zookeeper-recipes-lock" % V.Zookeeper  // ApacheV2
-  val jzmq          = "org.zeromq"                  % "jzmq"                   % V.Jzmq       // LGPLv3
+  val zmq           = "org.zeromq"                  %% "zeromq-scala-binding"  % V.ZMQ        // ApacheV2
 
   // Provided
 
