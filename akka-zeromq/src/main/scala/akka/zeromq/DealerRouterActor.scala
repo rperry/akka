@@ -30,7 +30,7 @@ private[zeromq] abstract class DealerRouterActor(socketType: Int, params: Socket
       poller.register(remoteSocket, Poller.POLLIN)
       poller.register(inprocServerSocket, Poller.POLLIN)
       receiveMessages
-      self.reply(Ok)
+      reply(Ok)
     }
     case message: ZMQMessage ⇒ {
       send(inprocClientSocket, message.frames)

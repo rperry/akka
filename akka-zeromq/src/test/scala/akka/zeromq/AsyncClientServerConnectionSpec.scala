@@ -49,8 +49,8 @@ class AsyncClientServerConnectionSpec extends Specification with BeforeAndAfter 
     def messages(listener: ActorRef) = {
       (listener ? QueryMessages).mapTo[List[ZMQMessage]].get
     }
-    lazy val clientListener = Actor.actorOf(new ListenerActor).start
-    lazy val serverListener = Actor.actorOf(new ListenerActor).start
+    lazy val clientListener = Actor.actorOf(new ListenerActor)
+    lazy val serverListener = Actor.actorOf(new ListenerActor)
     lazy val context = ZMQ.createContext
   }
   class ListenerActor extends Actor {
@@ -60,7 +60,7 @@ class AsyncClientServerConnectionSpec extends Specification with BeforeAndAfter 
         messages = message :: messages
       }
       case QueryMessages ⇒ {
-        self.reply(messages)
+        reply(messages)
       }
     }
   }

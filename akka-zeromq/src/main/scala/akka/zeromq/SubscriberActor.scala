@@ -10,7 +10,7 @@ private[zeromq] class SubscriberActor(params: SocketParameters) extends Abstract
   override def receive: Receive = {
     case Start ⇒ {
       bindOrConnectRemoteSocket; remoteSocket.subscribe(Array.empty); receiveMessages
-      self.reply(Ok)
+      reply(Ok)
     }
   }
   private def receiveMessages = spawn {

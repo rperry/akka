@@ -10,7 +10,7 @@ private[zeromq] class PublisherActor(params: SocketParameters) extends AbstractS
   override def receive: Receive = {
     case Start ⇒ {
       bindOrConnectRemoteSocket
-      self.reply(Ok)
+      reply(Ok)
     }
     case message: ZMQMessage ⇒ {
       send(remoteSocket, message.frames)

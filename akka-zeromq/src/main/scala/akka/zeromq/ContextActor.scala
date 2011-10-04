@@ -8,17 +8,17 @@ import org.zeromq.ZMQ.Context
 import org.zeromq.{ ZMQ ⇒ ZeroMQ }
 
 private[zeromq] class ContextActor extends Actor {
-  private var context: Context = _
+  private var zmqContext: Context = _
   override def receive: Receive = {
     case Start ⇒ {
-      context = ZeroMQ.context(1)
-      self.reply(Ok)
+      zmqContext = ZeroMQ.context(1)
+      reply(Ok)
     }
     case SocketRequest(socketType) ⇒ {
-      self.reply(context.socket(socketType))
+      reply(zmqContext.socket(socketType))
     }
     case PollerRequest ⇒ {
-      self.reply(context.poller)
+      reply(zmqContext.poller)
     }
   }
 }

@@ -23,7 +23,7 @@ class PubSubConnectionSpec extends Specification {
     def createSubscriber = {
       ZMQ.createSubscriber(context, new SocketParameters(endpoint, Connect, Some(listener)))
     }
-    lazy val listener = Actor.actorOf(new ListenerActor).start
+    lazy val listener = Actor.actorOf(new ListenerActor)
     lazy val context = ZMQ.createContext
     lazy val endpoint = "tcp://127.0.0.1:" + endpointPort
     lazy val payload = "hello".getBytes
